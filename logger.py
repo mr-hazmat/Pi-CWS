@@ -5,7 +5,6 @@ import sqlite3
 import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
-import csv
 
 import board
 import busio
@@ -18,16 +17,14 @@ BASE_DIR = Path.home() / "GitRepos" / "RPi_Compact-Weather-Station"
 LOG_DIR = BASE_DIR / "logs"
 DB_PATH = LOG_DIR / "weather.db"
 
+DOCS_DATA_DIR = BASE_DIR / "docs" / "data"
+EXPORT_SCRIPT = BASE_DIR / "export_weather.py"
+
 LOG_INTERVAL = 60               # seconds between sensor reads
-DB_FLUSH_INTERVAL = 300         # seconds between SQLite commits
-DB_BATCH_SIZE = 5               # max samples before forced commit
+DB_FLUSH_INTERVAL = 300         # seconds between SQLite commits (if batch not full)
+DB_BATCH_SIZE = 5               # samples before forced flush
 GIT_PUSH_INTERVAL_MINUTES = 30
 RETENTION_DAYS = 365
-
-CSV_EXPORT_DIR = Path.home() / "GitRepos" / "RPi_Compact-Weather-Station" / "docs" / "data"
-
-CSV_LAST_WEEK = CSV_EXPORT_DIR / "weather-last-week.csv"
-CSV_LAST_DAY = CSV_EXPORT_DIR / "weather-last-day.csv"
 
 # ----------------------
 # INITIALIZE SENSOR
@@ -40,6 +37,7 @@ sensor.sea_level_pressure = 1013.25
 # FILESYSTEM SETUP
 # ----------------------
 LOG_DIR.mkdir(parents=True, exist_ok=True)
+DOCS_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 # ----------------------
 # SQLITE SETUP
@@ -67,9 +65,29 @@ ON readings(timestamp)
 conn.commit()
 
 # ----------------------
+# LOGGING
+# ----------------------
+def _write_log(level: str, message: str, log_file: Path) -> None:
+    timestamp = datetime.now().isoformat(timespec="seconds")
+    line = f"{timestamp} [{level}] {message}\n"
+    with open(log_file, "a") as f:
+        f.write(line)
+    print(line, end="")
+
+def log_info(message: str) -> None:
+    """Routine operational messages (flushes, pushes, exports)."""
+    _write_log("INFO", message, LOG_DIR / "weather.log")
+
+def log_alert(message: str) -> None:
+    """Warnings and errors that need attention."""
+    _write_log("ALERT", message, LOG_DIR / "ALERTS.log")
+    # Also mirror alerts into the main log for a single unified stream
+    _write_log("ALERT", message, LOG_DIR / "weather.log")
+
+# ----------------------
 # HELPERS
 # ----------------------
-def is_online(host="github.com", port=443, timeout=5):
+def is_online(host: str = "github.com", port: int = 443, timeout: int = 5) -> bool:
     try:
         socket.create_connection((host, port), timeout=timeout)
         return True
@@ -77,100 +95,68 @@ def is_online(host="github.com", port=443, timeout=5):
         return False
 
 
-def log_alert(message: str):
-    alert_file = LOG_DIR / "ALERTS.log"
-    timestamp = datetime.now().isoformat(timespec="seconds")
-    with open(alert_file, "a") as f:
-        f.write(f"{timestamp} {message}\n")
-    print(f"[ALERT] {message}")
-
-def export_last_week():
-
-    CSV_EXPORT_DIR.mkdir(parents=True, exist_ok=True)
-
-    cutoff = (datetime.now() - timedelta(days=7)).isoformat(timespec="seconds")
-
+def export_json() -> bool:
+    """
+    Run export_weather.py to regenerate weather-data.json inside docs/data/.
+    Returns True on success, False on failure.
+    """
+    output_path = DOCS_DATA_DIR / "weather-data.json"
     try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
+        subprocess.run(
+            [
+                "python3", str(EXPORT_SCRIPT),
+                "--db", str(DB_PATH),
+                "--output", str(output_path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        log_info(f"JSON export written to {output_path}")
+        return True
+    except subprocess.CalledProcessError as e:
+        log_alert(f"JSON export failed: {e.stderr.strip()}")
+        return False
 
-        cursor.execute("""
-            SELECT
-                timestamp,
-                temp_c,
-                temp_f,
-                pressure_hpa,
-                humidity
-            FROM readings
-            WHERE timestamp >= ?
-            ORDER BY timestamp ASC
-        """, (cutoff,))
 
-        rows = cursor.fetchall()
-        conn.close()
-
-        if not rows:
-            log_alert("[CSV WEEKLY] No data found")
-            return
-
-        with open(CSV_LAST_WEEK, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                "timestamp",
-                "temp_c",
-                "temp_f",
-                "pressure_hpa",
-                "humidity"
-            ])
-            writer.writerows(rows)
-
-        log_alert(f"[CSV WEEKLY] Updated ({len(rows)} rows)")
-
-    except Exception as e:
-        log_alert(f"[CSV WEEKLY ERROR] {e}")
-
-def push_git():
+def push_git() -> None:
     now = datetime.now()
-    # export_last_day() -- Removing for general cleanliness
-    export_last_week()
+
+    if not export_json():
+        log_alert("Skipping git push because JSON export failed")
+        return
 
     if not is_online():
-        log_alert("[GIT] Offline, push skipped")
+        log_alert("Offline — git push skipped")
         return
 
     try:
+        subprocess.run(["git", "-C", str(BASE_DIR), "add", "."], check=True)
         subprocess.run(
-            ["git", "-C", str(BASE_DIR), "add", "."],
-            check=True
+            [
+                "git", "-C", str(BASE_DIR),
+                "commit", "-m",
+                f"Weather update {now.strftime('%Y-%m-%d %H:%M')}",
+            ],
+            check=True,
         )
-        subprocess.run(
-            ["git", "-C", str(BASE_DIR),
-             "commit", "-m",
-             f"Weather DB update {now.strftime('%Y-%m-%d %H:%M')}"],
-            check=True
-        )
-        subprocess.run(
-            ["git", "-C", str(BASE_DIR), "push"],
-            check=True
-        )
-        log_alert("[GIT] Push successful")
+        subprocess.run(["git", "-C", str(BASE_DIR), "push"], check=True)
+        log_info("Git push successful")
     except subprocess.CalledProcessError as e:
-        log_alert(f"[GIT ERROR] {e}")
+        log_alert(f"Git error: {e}")
 
 
-def purge_old_data():
+def purge_old_data() -> None:
     cutoff = (datetime.now() - timedelta(days=RETENTION_DAYS)).isoformat()
-    conn.execute(
-        "DELETE FROM readings WHERE timestamp < ?",
-        (cutoff,)
-    )
+    conn.execute("DELETE FROM readings WHERE timestamp < ?", (cutoff,))
     conn.commit()
-    log_alert("[DB] Old data purged")
+    log_info(f"Purged readings older than {RETENTION_DAYS} days")
+
 
 # ----------------------
 # MAIN LOOP
 # ----------------------
-log_alert("SQLite weather logger started")
+log_info("SQLite weather logger started")
 
 buffer = []
 last_log = time.monotonic()
@@ -198,21 +184,25 @@ try:
                 temp_c,
                 temp_f,
                 pressure,
-                humidity
+                humidity,
             ))
 
         # ----------------------
         # SQLite flush (batched)
+        # Flush when batch is full OR the time threshold has elapsed,
+        # but only if there is something to write.
         # ----------------------
-        if (
-            len(buffer) >= DB_BATCH_SIZE or
-            time.monotonic() - last_flush >= DB_FLUSH_INTERVAL
+        elapsed_since_flush = time.monotonic() - last_flush
+        if buffer and (
+            len(buffer) >= DB_BATCH_SIZE
+            or elapsed_since_flush >= DB_FLUSH_INTERVAL
         ):
             conn.executemany(
                 "INSERT OR IGNORE INTO readings VALUES (?, ?, ?, ?, ?)",
-                buffer
+                buffer,
             )
             conn.commit()
+            log_info(f"Flushed {len(buffer)} row(s) to DB")
             buffer.clear()
             last_flush = time.monotonic()
 
@@ -224,9 +214,9 @@ try:
             purge_old_data()
 
         # ----------------------
-        # Git push every :00 / :30
+        # Git push every :00 and :30
         # ----------------------
-        interval_id = now.strftime("%Y-%m-%d_%H_%M")
+        interval_id = now.strftime("%Y-%m-%d_%H") + ("_00" if now.minute < 30 else "_30")
         if now.minute % 30 == 0 and interval_id != last_git_push:
             last_git_push = interval_id
             push_git()
@@ -237,9 +227,10 @@ except KeyboardInterrupt:
     if buffer:
         conn.executemany(
             "INSERT OR IGNORE INTO readings VALUES (?, ?, ?, ?, ?)",
-            buffer
+            buffer,
         )
         conn.commit()
+        log_info(f"Flushed {len(buffer)} remaining row(s) on shutdown")
     conn.close()
-    log_alert("Logger stopped cleanly")
+    log_info("Logger stopped cleanly")
 

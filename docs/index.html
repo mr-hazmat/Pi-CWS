@@ -489,6 +489,8 @@
               grid: { color: grid },
             },
             y: {
+	      min: metric === "humidity" ? 0 : undefined,
+	      max: metric === "humidity" ? 100 : undefined,
               ticks: { color: text },
               grid: { color: grid },
               title: {
